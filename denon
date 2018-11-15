@@ -1,0 +1,30 @@
+#!/bin/bash
+
+rundir="/var/run/denon"
+cmd_pipe="$rundir/cmd_pipe"
+
+cd $rundir || exit
+
+quiet=0
+if [ "x$1" = "x-q" ]
+then
+  quiet=1
+  shift
+fi
+
+if [ $# != 0 -a "z$1" != "z" ]
+then
+  echo $@ > $cmd_pipe
+  sleep 1
+fi
+
+if [ $quiet = 0 ]
+then
+  for a in status.*
+  do
+    b=${a#status.}
+    c=`cat $a`
+    c=${c#* }
+    printf "%15s: %s\n" $b "$c"
+  done
+fi

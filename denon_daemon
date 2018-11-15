@@ -1,0 +1,252 @@
+#!/usr/bin/perl -w
+use strict;
+use POSIX;
+
+my $file="/dev/cu.usbserial";
+my $speed = B9600;
+my $logfile="/var/log/denon";
+my $rundir="/var/run/denon";
+my $cmd_pipe=$rundir . "/cmd_pipe";
+
+my $DEBUG=0;
+
+my %inputs=(
+  'TIVO' => 'HDP',
+  'MAC' => 'VCR',
+  'WII' => 'TV/CBL',
+  'DVD' => 'DVD',
+  'BLURAY' => 'V.AUX',
+  'TUNER' => 'TUNER',
+  '?' => '?'
+);
+
+my %outputs=();
+foreach (keys %inputs)
+{
+  $outputs{$inputs{$_}}=$_;
+}
+
+open(LOG,">>/var/log/denon") or die "Could not open /var/log/denon: $!\n";
+select(LOG); $|=1; select(STDOUT);
+
+unlink($cmd_pipe);
+if (!mkfifo($cmd_pipe,0666))
+{
+  die "Could not make fifo $cmd_pipe: $!\n";
+}
+
+foreach (<$rundir/status.*>)
+{
+  unlink($_);
+}
+
+sub do_log($)
+{
+  my ($msg)=@_;
+  print LOG scalar localtime(time) . " $msg\n";
+}
+
+sub write_status($@)
+{
+  my ($file,@val)=@_;
+  my $val=join(" ",@val);
+  my $t=time();
+  open(F,">$rundir/status.$file");
+  print F "$t $val\n";
+  close(F);
+  do_log("status.$file = $val");
+}
+
+sub change_input($$)
+{
+  my ($file,$val)=@_;
+  $val=$outputs{$val} if $outputs{$val};
+  write_status($file,$val);
+}
+
+# Convert Denon volume value to dB
+sub vol_to_db($)
+{
+  my ($vol)=@_;
+  # Ensure 3 digits
+  $vol .= "0" if $vol =~ /^..$/;
+  if ($vol eq '990') { return("---.-dB"); }
+  return sprintf("%.1fdB",($vol-800)/10);
+}
+
+# Convert dB to denon value
+# This can go from +18 to -80 or --- 
+# which maps to 98->0 or 99
+# Now we can do this in half values, so pretend 980->000 and strip
+# off a trailing zero
+sub db_to_vol($)
+{
+  my ($vol)=@_;
+  return $vol if $vol eq 'UP' || $vol eq 'DOWN' | $vol eq '?';
+
+  if ($vol =~ /^-+(\.-)?$/)
+  {
+    return(99);
+  }
+  if ($vol > 18 || $vol < -80)
+  {
+    print "Invalid input:$vol\n";
+    return("");
+  } 
+  $vol=int(800+10*$vol);
+  $vol=sprintf("%03d",$vol);
+  $vol=~s/0$//;
+  return($vol);
+}
+
+sub do_send($)
+{
+  my ($msg)=@_;
+  print SERIAL "$msg\r";
+  do_log("Wrote $msg");
+  sleep(1);
+}
+
+open(SERIAL,"+<$file") or die "Can not open $file: $!\n";
+select(SERIAL); $|=1; select(STDOUT);
+do_log("Opened $file");
+
+sleep(1);
+
+# Speeds!
+my $t =  POSIX::Termios->new;
+$t->getattr(fileno(SERIAL));
+$t->setispeed($speed);
+$t->setospeed($speed);
+$t->setattr(fileno(SERIAL), TCSANOW);
+
+do_send("");
+
+if (fork())
+{
+  exit;
+}
+setsid();
+
+# Sanity checks are for wimps
+my $pid=fork();
+if (!$pid)
+{
+  # Child can be serial port reader
+  my $buffer;
+  my $char;
+
+  while(sysread SERIAL,$char,1)
+  {
+    if (ord($char)==13)
+    {
+       do_log("DEBUG5 Buffer: $buffer") if $DEBUG>=5;
+
+          if ($buffer =~ /^(CV|SD|DC|PS|Z2MAX|MVMAX)(.*)$/) { do_log("DEBUG3: Ignoring $1$2") if $DEBUG>=3; }
+       elsif ($buffer =~ /^PW(.*)$/) { write_status("Power",$1); }
+       elsif ($buffer =~ /^SI(.*)$/) { change_input("Input",$1); }
+       elsif ($buffer =~ /^MU(.*)$/) { write_status("Mute",$1); }
+       elsif ($buffer =~ /^ZM(.*)$/) { write_status("MainZone",$1); }
+       elsif ($buffer =~ /^MS(.*)$/) { write_status("MainSurround",$1); }
+       elsif ($buffer =~ /^MVMAX (.*)$/) { write_status("MaxVolume",$1,vol_to_db($1)); }
+       elsif ($buffer =~ /^MV(.*)$/) { write_status("Volume",$1,vol_to_db($1)); }
+       elsif ($buffer =~ /^CV(.*) (.*)$/) { write_status("ChannelVolume.1$1",$2,vol_to_db($2)); }
+       elsif ($buffer =~ /^Z2MU(.*)$/) { write_status("Z2Mute",$1); }
+       elsif ($buffer =~ /^Z2(ON|OFF)$/) { write_status("Zone2",$1); }
+       elsif ($buffer =~ /^Z2MAX (\d+)$/) { write_status("Z2MaxVolume",$1,vol_to_db($1)); }
+       elsif ($buffer =~ /^Z2(\d+)$/) { write_status("Z2Volume",$1,vol_to_db($1)); }
+       elsif ($buffer =~ /^Z2(.*)$/) { change_input("Zone2Input",$1); }
+       elsif ($buffer =~ /^SD(.*)$/) { write_status("DigitalSource",$1); }
+       elsif ($buffer =~ /^DC(.*)$/) { write_status("DigitInput",$1); }
+       elsif ($buffer =~ /^PS(.*):(.*)$/) { write_status("ParameterSetting.$1",$2); }
+       else { do_log "!!Unknown $buffer"; }
+       $buffer="";
+    }
+    else
+    {
+       $buffer .= $char;
+    }
+  }
+  print "Reader done\n";
+}
+else
+{
+  # Before we start, let's work out the status.  Send the first
+  # command twice 'cos the input sometimes loses first char!
+  foreach ("PW?","PW?","Z2?","MS?","SI?","MV?","CV?")
+  {
+    do_send($_);
+  }
+
+  my $quit=0;
+  # Parent reads from FIFO and write it to the device
+  while(!$quit)
+  {
+    open(CMD,"<$cmd_pipe") or die "Could not open $cmd_pipe: $!\n";
+
+    while(<CMD>)
+    {
+      tr/a-z/A-Z/;
+      chomp;
+      if (/^QUIT$/)
+      {
+        $quit=1;
+        last;
+      }
+      elsif (/^INPUT (.*)$/)
+      {
+        if ($inputs{$1})
+        {
+          $_="SI" . $inputs{$1};
+        }
+        else
+        {
+          print "Unknown input $1\n";
+          next;
+        }
+      }
+      elsif (/^POWER (ON|STANDBY|OFF|\?)$/)
+      {
+        $_="PW$1";
+        $_="PWSTANDBY" if $1 eq 'OFF';
+      }
+      elsif (/^MAINPOWER (ON|OFF|\?)$/)
+      {
+        $_="ZM$1";
+      }
+      elsif (/^Z2POWER (ON|OFF|\?)$/)
+      {
+        $_="Z2$1";
+      }
+      elsif (/^VOL(UME)? (.*)$/)
+      {
+        my $vol=db_to_vol($2); next if ($vol eq ''); $_="MV$vol";
+      }
+      elsif (/^Z2VOL(UME)? (.*)$/)
+      {
+        my $vol=db_to_vol($2); next if ($vol eq ''); $_="Z2$vol";
+      }
+      elsif (/^MUTE (ON|OFF|\?)$/)
+      {
+        $_="MU$1";
+      }
+      elsif (/^Z2MUTE (ON|OFF|\?)$/)
+      {
+        $_="Z2MU$1";
+      }
+      elsif (/^!(.*)$/)
+      {
+        # Allow direct commands
+        $_=$1;
+      }
+      else
+      {
+        print "Unknown command: $_\n";
+        next;
+      }
+      do_send($_) unless $quit;
+    }
+  }
+  do_log("Input closed; killing reader $pid");
+  kill(15,$pid);
+}
